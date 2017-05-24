@@ -16,25 +16,26 @@ class SeasonalElasticNetCVModel(ElasticNetCVBaseModel):
         Base temperature (degrees F) used in calculating cooling degree days.
     heating_base_temp : float
         Base temperature (degrees F) used in calculating heating degree days.
-    n_bootstrap : int
-        Number of points to exclude during bootstrap error estimation.
+    custom_holidays : None for United States holidays, or pass in a custom object
+        which implements the "get" method as in the holidays package.
     '''
 
     def __init__(self, cooling_base_temp=65, heating_base_temp=65,
-                 n_bootstrap=100, modeling_period_interpretation='baseline'):
+                 modeling_period_interpretation='baseline',
+                 custom_holidays = None):
 
         super(SeasonalElasticNetCVModel, self).__init__(
-            cooling_base_temp, heating_base_temp, n_bootstrap)
+            cooling_base_temp, heating_base_temp)
         self.modeling_period_interpretation = modeling_period_interpretation
+        self.custom_holidays = custom_holidays
 
     def __repr__(self):
         return (
             'SeasonalElasticNetCVModel(cooling_base_temp={},'
-            ' heating_base_temp={}, n_bootstrap={})'
+            ' heating_base_temp={})'
             .format(
                 self.cooling_base_temp,
                 self.heating_base_temp,
-                self.n_bootstrap
             )
         )
 
@@ -64,19 +65,16 @@ class SeasonalElasticNetCVModel(ElasticNetCVBaseModel):
 
         formula = self.base_formula
 
-        # Check length of trace and ensure we have enough data to bootstrap
-        # the error estimate.
-
         # Make sure these factors have enough levels to not
         # cause issues.
-        if len(np.unique(model_data.index.month[:-self.n_bootstrap])) >= 12:
+        if len(np.unique(model_data.index.month)) >= 12:
             formula += (
                 ' + CDD * C(tempF.index.month)'
                 ' + HDD * C(tempF.index.month)'
                 ' + C(tempF.index.month)'
             )
 
-        if len(np.unique(model_data.index.weekday[:-self.n_bootstrap])) >= 7:
+        if len(np.unique(model_data.index.weekday)) >= 7:
             formula += (
                 ' + (CDD) * C(tempF.index.weekday)'
                 ' + (HDD) * C(tempF.index.weekday)'
@@ -84,7 +82,7 @@ class SeasonalElasticNetCVModel(ElasticNetCVBaseModel):
             )
 
         holiday_names = self._holidays_indexed(
-            model_data.index[:-self.n_bootstrap])
+            model_data.index)
 
         if len(np.unique(holiday_names)) == 11:
             model_data.loc[:, 'holiday_name'] = self._holidays_indexed(
@@ -94,7 +92,10 @@ class SeasonalElasticNetCVModel(ElasticNetCVBaseModel):
 
     @staticmethod
     def _holidays_indexed(dt_index):
-        holidays_raw = holidays.UnitedStates()
+        if self.custom_holidays is None:
+            holidays_raw = holidays.UnitedStates()
+        else:
+            holidays_raw = self.custom_holidays
 
         def clean_holiday_name(dt):
             raw_name = holidays_raw.get(dt, "none")

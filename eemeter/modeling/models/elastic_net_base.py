@@ -19,11 +19,10 @@ class ElasticNetCVBaseModel(object):
     The rest is shared in this base model.
     """
 
-    def __init__(self, cooling_base_temp, heating_base_temp, n_bootstrap):
+    def __init__(self, cooling_base_temp, heating_base_temp):
 
         self.cooling_base_temp = cooling_base_temp
         self.heating_base_temp = heating_base_temp
-        self.n_bootstrap = n_bootstrap
 
         self.base_formula = 'energy ~ 1 + CDD + HDD + CDD:HDD'
 
@@ -128,10 +127,6 @@ class ElasticNetCVBaseModel(object):
         self.variance = self.rmse ** 2
         self.n = n
 
-        # compute bootstrapped empirical errors (if possible) for when we want
-        # summed errors.
-        self.error_fun = self._bootstrap_empirical_errors()
-
         self.params = {
             "coefficients": list(model_obj.coef_),
             "intercept": model_obj.intercept_,
@@ -149,63 +144,6 @@ class ElasticNetCVBaseModel(object):
             "n": self.n
         }
         return output
-
-    def _bootstrap_empirical_errors(self):
-        ''' Calculate empirical bootstrap error function '''
-
-        min_points = self.n_bootstrap * 2
-
-        # fallback error function
-        if len(self.X) < min_points:
-            return lambda n: self.rmse * (n**0.8)
-
-        # split data n_splits times collecting residuals.
-        # splits on every index from (n_bootstrap from end)
-        # to (n_bootstrap - n_splits from end)
-        n_splits = int(self.n_bootstrap / 2)
-        resid_stack = []
-        for i in range(n_splits):
-
-            split_index = (-self.n_bootstrap) + i
-            pre_split = slice(None, split_index)
-            post_split = slice(split_index, None)
-            X_pre = self.X[pre_split]
-            X_post = self.X[post_split]
-            y_pre = self.y.values.ravel()[pre_split]
-            y_post = self.y.values.ravel()[post_split]
-
-            bootstrap_model = self.model_obj.fit(X_pre, y_pre)
-            test = bootstrap_model.predict(X_post)
-            resid = test[:n_splits] - y_post[:n_splits]
-            resid_stack.append(resid)
-        resid_stack = np.array(resid_stack)
-
-        # from residuals determine alpha and beta
-        xs = list(range(1, 50))
-        ys = [np.std(np.sum(resid_stack[:, 0:i], axis=1)) for i in xs]
-
-        n_ys = len(ys)
-        alpha = (
-            (
-                n_ys * (
-                    np.sum([
-                        np.log(x) * np.log(y)
-                        for x, y in zip(xs, ys)
-                    ])
-                ) -
-                np.sum(np.log(xs)) * np.sum(np.log(ys))
-            ) / (
-                n_ys * np.sum(np.log(xs)**2) -
-                np.sum(np.log(xs))**2
-            )
-        )
-        beta = np.exp(
-            (
-                np.sum(np.log(ys)) -
-                alpha * np.sum(np.log(xs))
-            ) / n_ys
-        )
-        return lambda n: beta * (n**alpha)
 
     def predict(self, demand_fixture_data, params=None, summed=True):
         ''' Predicts across index using fitted model params
@@ -257,9 +195,7 @@ class ElasticNetCVBaseModel(object):
         if summed:
             n = len(predicted)
             predicted = np.sum(predicted)
-            stddev = self.error_fun(n)
-            variance = stddev ** 2
-            # Convert to 95% confidence limits
+            variance = self.variance * n
         else:
             # add NaNs back in
             predicted = predicted.reindex(model_data.index)

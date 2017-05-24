@@ -14,25 +14,22 @@ class BillingElasticNetCVModel(ElasticNetCVBaseModel):
         Base temperature (degrees F) used in calculating cooling degree days.
     heating_base_temp : float
         Base temperature (degrees F) used in calculating heating degree days.
-    n_bootstrap : int
-        Number of points to exclude during bootstrap error estimation.
     '''
 
     def __init__(self, cooling_base_temp=65, heating_base_temp=65,
-                 n_bootstrap=100, modeling_period_interpretation='baseline'):
+                 modeling_period_interpretation='baseline'):
 
         super(BillingElasticNetCVModel, self).__init__(
-            cooling_base_temp, heating_base_temp, n_bootstrap)
+            cooling_base_temp, heating_base_temp)
         self.modeling_period_interpretation = modeling_period_interpretation
 
     def __repr__(self):
         return (
             'BillingElasticNetCVModel(cooling_base_temp={},'
-            ' heating_base_temp={}, n_bootstrap={})'
+            ' heating_base_temp={})'
             .format(
                 self.cooling_base_temp,
                 self.heating_base_temp,
-                self.n_bootstrap
             )
         )
 
