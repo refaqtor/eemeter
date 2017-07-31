@@ -89,6 +89,8 @@ date_readers = [
     date_reader('%Y-%m-%d %H:%M:%S'),
     date_reader('%Y-%m-%dT%H:%M:%S'),
     date_reader('%Y-%m-%dT%H:%M:%SZ'),
+    date_reader('%m/%d/%Y'),
+    date_reader('%m/%d/%y'),
 ]
 
 
