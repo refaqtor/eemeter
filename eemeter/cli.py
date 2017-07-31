@@ -91,6 +91,8 @@ date_readers = [
     date_reader('%Y-%m-%dT%H:%M:%SZ'),
     date_reader('%m/%d/%Y'),
     date_reader('%m/%d/%y'),
+    date_reader('%m/%d/%Y %H:%M:%S'),
+    date_reader('%m/%d/%y %H:%M:%S'),
 ]
 
 
