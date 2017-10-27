@@ -9,7 +9,7 @@ ELECTREICITY_ENERGY = 'ELECTRICITY_CONSUMPTION_SUPPLIED'
 
 def read_savings_data(fname, energy_type):
     df = pd.read_csv(fname)
-    if energy_type == 'gas':
+    if energy_type == GAS_ENERGY:
         df = df[['heating_coefficient',
                  'intercept_coefficient',
                  'project_climate_zone',
@@ -69,7 +69,7 @@ class SimpeSavingPredictionUsingHistoricalData:
         self.fitted_model = None
         self.model_obj = None
 
-    def __init__(self, model_params):
+    def initFromModelWeights(self, model_params):
         self.model_weights = model_params
 
     def predict(self, df):
