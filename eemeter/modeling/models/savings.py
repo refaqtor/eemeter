@@ -88,12 +88,12 @@ class SimpeSavingPredictionUsingHistoricalData:
         if model_weight_keys != feature_values.keys():
             raise ValueError("Feature Keys and Model Weights Keys do not match")
 
-        saving = self.model_weights['Intercept']
+        response = self.model_weights['Intercept']
         for feature_key, value in feature_values.items():
             feature_weight = self.model_weights[feature_key]
-            saving += (value * feature_weight)
+            response += (value * feature_weight)
 
-        return saving
+        return response
 
     def out_of_sample_stats(self, df, response_var_name=None):
         prediction = self.predict(df)
