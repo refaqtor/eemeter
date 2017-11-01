@@ -1,0 +1,347 @@
+import pandas as pd
+import numpy as np
+import csv, os, datetime, dateutil
+import eemeter
+from eemeter.processors.location import (
+    get_weather_normal_source,
+    get_weather_source,
+)
+from eemeter.structures import ZIPCodeSite
+from eemeter.modeling.models import CaltrackHourlyModel
+from eemeter.structures import EnergyTrace
+from eemeter.modeling.formatters import ModelDataFormatter
+import pytz
+from eemeter.weather.location import (
+    zipcode_to_usaf_station,
+    zipcode_to_tmy3_station,
+)
+from eemeter.weather.tmy3 import TMY3WeatherSource
+from eemeter.weather.noaa import ISDWeatherSource
+
+from pandas.tseries.offsets import DateOffset
+import json
+
+
+def load_projects(projects_file):
+    projects = {}
+    with open(projects_file, 'r') as f:
+        fcsv = csv.reader(f)
+        header = fcsv.next()
+        for row in fcsv:
+            projects[row[0]] = {'project_id': row[0],
+                                'zipcode': row[1],
+                                'baseline_period_end': row[2],
+                                'reporting_period_start': row[3]}
+
+    return projects
+
+
+site_id_to_trace = json.load(open("/vagrant/etl-natgrid-lime/test_data/maps/site_to_circuit.json"))
+trace_to_site = {vv : kk for kk, vv in site_id_to_trace.items()}
+
+def get_trace_file(base_dir, trace_id):
+    site_id = trace_to_site[trace_id]
+    file = os.path.join(base_dir, "new_" +site_id + ".csv")
+    return file
+
+def compute_weekly_saving(reporting_data, baseline_model):
+    #print reporting_data
+    nweeks = len(reporting_data.resample('D').sum())/7
+    first_date = reporting_data.index[0]
+    week_saving = []
+    date_index = []
+    actual_week_usage = []
+    print baseline_model.params
+    for n in range(nweeks):
+        week_date = first_date + datetime.timedelta(days=7  * n)
+        df = reporting_data[first_date + datetime.timedelta(days=7*n) : first_date + datetime.timedelta(days=7* (n + 1)) - datetime.timedelta(days=1)]
+        predicted_usage, var= baseline_model.predict(df, summed=False)
+        actual_usage = df['energy'].sum()
+        predicted_usage = sum([xx for xx in predicted_usage])
+        savings = predicted_usage - actual_usage
+        week_saving.append(savings)
+        date_index.append(week_date)
+        actual_week_usage.append(actual_usage)
+
+    return pd.DataFrame({"savings" : week_saving, 'actual_weekly_usage' : actual_week_usage}, index=date_index)
+
+
+
+def reindex(df):
+    """
+
+    Parameters
+    ----------
+    df
+
+    Returns
+    -------
+
+    """
+    new_df = df.resample("H")
+    last_index = df.index[0]
+    last_value = None
+    df_list = []
+    for index, row in df.iterrows():
+        if index == last_index:
+            last_value = row['energy']
+            continue
+        num_hours = (index - last_index).days * 24.0
+        #print num_hours, index, last_index
+        mean = last_value / num_hours
+        range = pd.date_range(start=last_index, end=index, freq='H')
+        temp_df = pd.DataFrame({
+            'energy' : [mean for xx in range]
+        }, index=range)
+        df_list.append(temp_df)
+        last_index = index
+        last_value = row['energy']
+    new_df = pd.concat(df_list)
+    #print new_df
+    return new_df[~new_df.index.duplicated(keep='first')]
+
+def build_model(trace_file,
+                base_trace_dir,
+                trace_id_to_project,
+                projects):
+    data = pd.read_csv(trace_file, index_col=3, parse_dates=True)
+    data['value'] = pd.to_numeric(data['value'], errors='coerce')
+    data = data.rename(columns={'value' : 'energy', 'start' : 'index'})
+
+    data = data.tz_localize('UTC', level=0).sort_index()
+
+    trace_id = data['trace_id'].tolist()[0]
+    if "_" in trace_id:
+        trace_id = trace_id.split("_")[0]
+    project_id = trace_id_to_project.get(trace_id, '')
+    start_date = dateutil.parser.parse(projects[project_id]['baseline_period_end'])
+    end_date = dateutil.parser.parse(projects[project_id]['reporting_period_start'])
+
+    if not project_id:
+        print 'Could not find project id for trace id ' + trace_id
+        return
+
+    zipcode = projects[project_id]['zipcode']
+        station = zipcode_to_usaf_station(zipcode)
+        weather_source = ISDWeatherSource(station)
+
+    print 'Baseine Period end Date', start_date
+    print 'Reporting period start date ', end_date
+
+
+    baseline_data = data[data.index < start_date]
+
+    if len(baseline_data.index) < 1:
+        return None
+
+    dummy_index = baseline_data.index[-1] + DateOffset(months=1)
+
+    nan_df = pd.DataFrame({
+        'energy' : [np.NaN]
+    }, index = [dummy_index])
+
+    baseline_data = baseline_data.append(nan_df)
+
+    baseline_data = baseline_data.drop(['estimated', 'interpretation', 'unit', 'trace_id'], axis=1)
+    baseline_data = reindex(baseline_data)
+    #print baseline_data
+
+    baseline_tseries_index = pd.DataFrame(index=baseline_data.index)
+    baseline_tseries_index = baseline_tseries_index.asfreq('H', method='ffill', fill_value=np.NaN)
+    baseline_tempF = weather_source.indexed_temperatures(baseline_tseries_index.index,
+                                                         'degF',allow_mixed_frequency=True)
+    baseline_tempF = baseline_tempF.to_frame()
+
+    reporting_trace_file = get_trace_file(base_trace_dir, trace_id)
+    site_id = os.path.basename(reporting_trace_file).split("_")[1][:-4]
+
+    reporting_data= pd.read_csv(reporting_trace_file, index_col=3, parse_dates=True)
+    reporting_data['value'] = pd.to_numeric(reporting_data['value'], errors='coerce')
+    reporting_data = reporting_data.rename(columns={'value' : 'energy', 'start' : 'index'})
+    reporting_data = reporting_data.drop(['estimated', 'interpretation', 'unit', 'trace_id'], axis=1)
+    reporting_data = reporting_data.tz_localize('UTC', level=0).sort_index()
+
+    if len(reporting_data.index) < 1:
+        return None
+    """
+    reporting_dummy_index = reporting_data.index[-1] + DateOffset(days=1)
+
+    reporting_nan_df = pd.DataFrame({
+        'energy' : [np.NaN]
+    }, index = [reporting_dummy_index])
+    reporting_data = reporting_data.append(reporting_nan_df)
+    """
+    reporting_data = reporting_data[~reporting_data.index.duplicated(keep='first')]
+
+    reporting_tseries_index = pd.DataFrame(index=reporting_data.index)
+
+    reporting_tseries_index = reporting_tseries_index.asfreq('H', method='ffill', fill_value=np.NaN)
+
+    reporting_tempF = weather_source.indexed_temperatures(reporting_tseries_index.index,
+                                                         'degF',allow_mixed_frequency=True)
+    reporting_tempF = reporting_tempF.to_frame()
+
+
+    baseline_model = CaltrackHourlyModel(fit_cdd = True,
+                                         grid_search = True,
+                                         modeling_period_interpretation='baseline')
+
+
+    baseline_data = pd.DataFrame({
+        'energy' : baseline_data['energy'],
+        'tempF' : baseline_tempF[0]
+    }, index=baseline_data.index)
+    baseline_output = baseline_model.fit(baseline_data)
+
+    reporting_data = pd.DataFrame({
+        'energy' : reporting_data['energy'],
+        'tempF' : reporting_tempF[0]
+    }, index=reporting_data.index)
+
+    return project_id, trace_id + "_" + site_id, zipcode, baseline_data, reporting_data, baseline_model
+
+def get_normalized_temp(daily_series, zipcode):
+    """
+
+    Parameters
+    ----------
+    daily_series
+
+    Returns
+    -------
+
+    """
+    station = zipcode_to_usaf_station(zipcode)
+    weather_source = ISDWeatherSource(station)
+    tempF = weather_source.indexed_temperatures(daily_series,'degF')
+    return tempF
+
+def get_actual_temp(daily_series, zipcode):
+    """
+
+    Parameters
+    ----------
+    daily_series
+
+    Returns
+    -------
+
+    """
+    station = zipcode_to_usaf_station(zipcode)
+    weather_source = ISDWeatherSource(station)
+    tempF = weather_source.indexed_temperatures(daily_series,'degF')
+    return tempF
+
+def compute_number_week(series_data):
+    series_data = series_data.asfreq('H', method='pad')
+    return len(series_data.index) / (7 * 24.0)
+
+def compute_stats(zipcode, baseline_data, reporting_data, baseline_model, reporting_model):
+    baseline_prediction_period = pd.Series(index=baseline_data.index)
+    baseline_prediction_period = baseline_prediction_period.asfreq('H', method='pad').to_frame()
+
+    reporting_prediction_period = pd.Series(index=reporting_data.index)
+    reporting_prediction_period = reporting_prediction_period.asfreq('H', method='pad')
+
+
+    baseline_actual_temp = get_actual_temp(baseline_prediction_period.index, zipcode)
+    baseline_actual_temp = pd.DataFrame({'tempF' : baseline_actual_temp.values},
+                                   index=baseline_actual_temp.index)
+
+    reporting_actual_temp = get_actual_temp(reporting_prediction_period.index, zipcode)
+
+    reporting_actual_temp = pd.DataFrame({'tempF' : reporting_actual_temp.values},
+                                   index=reporting_actual_temp.index)
+
+
+    pred_reporting_period_usage, pred_reporting_period_variance = baseline_model.predict(reporting_actual_temp, summed=True)
+    pred_baseline_period_usage, pred_baseline_period_variance = reporting_model.predict(baseline_actual_temp, summed=True)
+    total_actual_saving  = (pred_reporting_period_usage - reporting_data['energy'].sum()) + (baseline_data['energy'].sum() - pred_baseline_period_usage)
+    print "Total  Actual Saving ", total_actual_saving
+    #print baseline_prediction_period.index[0], baseline_prediction_period.index[-1]
+    #print reporting_prediction_period.index[0], reporting_prediction_period.index[-1]
+
+    total_weeks = compute_number_week(baseline_prediction_period) + compute_number_week(reporting_prediction_period)
+    print "Total Weeks " , total_weeks
+    total_actual_weekly_savings=(total_actual_saving* 1.0) / total_weeks
+    print "Weekly Actual Saving ", (total_actual_saving * 1.0) / total_weeks
+
+    baseline_normalized_temp = get_normalized_temp(baseline_prediction_period.index, zipcode)
+    baseline_normalized_temp = pd.DataFrame({'tempF' : baseline_normalized_temp.values},
+                                   index=baseline_normalized_temp.index)
+
+    reporting_normalized_temp = get_normalized_temp(reporting_prediction_period.index, zipcode)
+    reporting_normalized_temp = pd.DataFrame({'tempF' : reporting_normalized_temp.values},
+                                   index=reporting_normalized_temp.index)
+
+
+    pred_reporting_period_usage, pred_reporting_period_variance = baseline_model.predict(reporting_normalized_temp, summed=True)
+    pred_baseline_period_usage, pred_baseline_period_variance = reporting_model.predict(baseline_normalized_temp, summed=True)
+    total_normalized_saving  = (pred_reporting_period_usage - reporting_data['energy'].sum()) + (baseline_data['energy'].sum() - pred_baseline_period_usage)
+    total_normalized_weekly_savings=(total_normalized_saving * 1.0) / total_weeks
+    print "Total  Normalized Saving ", total_normalized_saving
+    print "Weekly  Normalized Saving ", (total_normalized_saving * 1.0) / total_weeks
+
+    return(total_actual_saving , total_normalized_saving, total_actual_weekly_savings, total_normalized_weekly_savings )
+
+
+if __name__ == '__main__':
+  projects_file = '/vagrant/etl-natgrid-lime/test_data/projects/Lime_Metering_Extract_070617.csv'
+  projects = load_projects(projects_file)
+  ciruit_to_project_fname = '/vagrant/etl-natgrid-lime/test_data/maps/circuit_to_proj.json'
+  trace_id_to_project = json.load(open(ciruit_to_project_fname))
+
+  trace_dir = "/vagrant/etl-natgrid-lime/test_data/traces"
+  experiment_name="hourly_07-08"
+  """
+  outfile = open('/vagrant/etl-natgrid-lime/test_data/output_hrly_all_data.csv', 'wb')
+  header = "experiment_name,project_id,trace_id,total_actual_saving,total_normalized_saving,total_actual_weekly_savings,total_normalized_weekly_savings,baseline_model_r2," \
+           "baseline_model_rmse,baseline_mdoel_cvrmse,reporting_model_r2,reporting_model_rmse,reporting_model_cvrmse"
+  outfile.write(header)
+  outfile.write("\n")
+  """
+  all_df = []
+  for file in os.listdir(trace_dir):
+      if not file.startswith("historical"):
+          continue
+
+      full_path = os.path.join(trace_dir, file)
+      print "Processing ", full_path
+      model_out = build_model(full_path, trace_dir,
+                              trace_id_to_project, projects)
+
+      if model_out is None:
+          print "Insufficent data in trace file ", full_path
+          continue
+      project_id, trace_id, zipcode, baseline_data, reporting_data, baseline_model = model_out
+      weekly_actual_saving = compute_weekly_saving(reporting_data, baseline_model)
+
+      weekly_actual_saving = pd.DataFrame({"project_id" : [project_id for xx in weekly_actual_saving.index],
+                                           "trace_id" : [trace_id for xx in weekly_actual_saving.index],
+                                           "savings" :  weekly_actual_saving['savings'],
+                                           "experiment" : [experiment_name for xx in weekly_actual_saving.index],
+                                           "actual_weekly_usage" : weekly_actual_saving['actual_weekly_usage']}
+                                          , index=weekly_actual_saving.index
+                                          )
+
+      #print df
+      all_df.append(weekly_actual_saving)
+      """
+      total_actual_saving , total_normalized_saving, total_actual_weekly_savings, total_normalized_weekly_savings = \
+          compute_stats(zipcode, baseline_data, reporting_data, baseline_model, reporting_model)
+
+      row = [experiment_name,project_id , trace_id , str(total_actual_saving) ,  str(total_normalized_saving), \
+            str(total_actual_weekly_savings), str(total_normalized_weekly_savings), \
+            str(baseline_model.r2), str(baseline_model.rmse), baseline_model.cvrmse,
+             reporting_model.r2, reporting_model.rmse, reporting_model.cvrmse]
+
+      row_str = ",".join([str(xx) for xx in row])
+      outfile.write(row_str)
+
+      outfile.write("\n")
+      """
+  out_df = pd.concat(all_df)
+  out_df.to_csv("/vagrant/etl-natgrid-lime/test_data/output_hourly_all_data.csv", index_label="week_start_date")
+
+  #outfile.close()
+
